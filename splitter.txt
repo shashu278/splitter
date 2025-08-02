@@ -1,0 +1,689 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { initializeApp } from 'firebase/app';
+import { 
+    getAuth, 
+    signInAnonymously, 
+    onAuthStateChanged,
+    signInWithCustomToken
+} from 'firebase/auth';
+import { 
+    getFirestore, 
+    doc, 
+    setDoc, 
+    getDoc, 
+    collection, 
+    addDoc, 
+    onSnapshot,
+    query,
+    orderBy
+} from 'firebase/firestore';
+
+// --- Helper Functions & Initial Config ---
+
+// This function generates a unique ID for new items
+const generateUniqueId = () => `id_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+// --- Main App Component ---
+
+export default function App() {
+    // --- Firebase State ---
+    const [db, setDb] = useState(null);
+    const [auth, setAuth] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+
+    // --- App View State ---
+    const [currentView, setCurrentView] = useState('loading'); // loading, setup, split, results, history
+    
+    // --- Data State ---
+    const [housemates, setHousemates] = useState([]);
+    const [items, setItems] = useState([{ id: generateUniqueId(), name: '', price: '', assigned: [] }]);
+    const [tax, setTax] = useState('');
+    const [tip, setTip] = useState('');
+    const [billTitle, setBillTitle] = useState('');
+    
+    const [results, setResults] = useState(null);
+    const [pastBills, setPastBills] = useState([]);
+    const [selectedBill, setSelectedBill] = useState(null);
+    
+    // --- UI State ---
+    const [isEditingHousemates, setIsEditingHousemates] = useState(false);
+    const [tempHousemates, setTempHousemates] = useState(Array(7).fill(''));
+    const [error, setError] = useState('');
+
+    // --- Firebase Initialization and Auth Effect ---
+    useEffect(() => {
+        // Use the globally provided Firebase config
+        const firebaseConfig = typeof __firebase_config !== 'undefined' 
+            ? JSON.parse(__firebase_config) 
+            : null;
+
+        if (!firebaseConfig) {
+            console.error("Firebase config is not available.");
+            setError("Firebase configuration is missing. The app cannot connect to the database.");
+            setCurrentView('error');
+            return;
+        }
+
+        const app = initializeApp(firebaseConfig);
+        const firestoreDb = getFirestore(app);
+        const firebaseAuth = getAuth(app);
+
+        setDb(firestoreDb);
+        setAuth(firebaseAuth);
+
+        const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+            if (user) {
+                setUserId(user.uid);
+            } else {
+                try {
+                    // Sign in with custom token if available, otherwise sign in anonymously
+                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                        await signInWithCustomToken(firebaseAuth, __initial_auth_token);
+                    } else {
+                        await signInAnonymously(firebaseAuth);
+                    }
+                } catch (authError) {
+                    console.error("Authentication failed:", authError);
+                    setError("Could not authenticate with the database. Please refresh the page.");
+                    setCurrentView('error');
+                }
+            }
+            setIsAuthReady(true);
+        });
+
+        return () => unsubscribe();
+    }, []);
+
+    // --- Data Fetching Effect (Housemates & Bills) ---
+    useEffect(() => {
+        if (!isAuthReady || !db || !userId) return;
+
+        // Fetch Housemates
+        const housematesDocRef = doc(db, `artifacts/${__app_id}/users/${userId}/appData/housemates`);
+        const unsubscribeHousemates = onSnapshot(housematesDocRef, (docSnap) => {
+            if (docSnap.exists()) {
+                const data = docSnap.data();
+                setHousemates(data.names || []);
+                setTempHousemates(data.names.length > 0 ? [...data.names, ...Array(Math.max(0, 7 - data.names.length)).fill('')] : Array(7).fill(''));
+                setCurrentView(data.names.length > 0 ? 'split' : 'setup');
+            } else {
+                setCurrentView('setup');
+            }
+        }, (err) => {
+            console.error("Error fetching housemates:", err);
+            setError("Could not load your housemate data.");
+        });
+
+        // Fetch Past Bills
+        const billsCollectionRef = collection(db, `artifacts/${__app_id}/users/${userId}/bills`);
+        const q = query(billsCollectionRef); // Removed orderBy to avoid index issues
+        const unsubscribeBills = onSnapshot(q, (querySnapshot) => {
+            const billsData = [];
+            querySnapshot.forEach((doc) => {
+                billsData.push({ id: doc.id, ...doc.data() });
+            });
+            // Sort in memory
+            billsData.sort((a, b) => b.createdAt.toDate() - a.createdAt.toDate());
+            setPastBills(billsData);
+        }, (err) => {
+            console.error("Error fetching past bills:", err);
+            setError("Could not load your past bills.");
+        });
+
+        return () => {
+            unsubscribeHousemates();
+            unsubscribeBills();
+        };
+    }, [isAuthReady, db, userId]);
+
+    // --- Event Handlers ---
+
+    const handleSaveHousemates = async () => {
+        const validHousemates = tempHousemates.map(h => h.trim()).filter(h => h !== '');
+        if (validHousemates.length < 2) {
+            setError("Please enter at least two housemates.");
+            return;
+        }
+        setError('');
+        
+        try {
+            const housematesDocRef = doc(db, `artifacts/${__app_id}/users/${userId}/appData/housemates`);
+            await setDoc(housematesDocRef, { names: validHousemates });
+            setHousemates(validHousemates);
+            setIsEditingHousemates(false);
+            setCurrentView('split');
+        } catch (e) {
+            console.error("Error saving housemates: ", e);
+            setError("Failed to save housemates. Please try again.");
+        }
+    };
+
+    const handleItemChange = (id, field, value) => {
+        setItems(items.map(item => item.id === id ? { ...item, [field]: value } : item));
+    };
+
+    const handleAssignPerson = (itemId, personName) => {
+        setItems(items.map(item => {
+            if (item.id === itemId) {
+                const assigned = item.assigned.includes(personName)
+                    ? item.assigned.filter(p => p !== personName)
+                    : [...item.assigned, personName];
+                return { ...item, assigned };
+            }
+            return item;
+        }));
+    };
+    
+    const handleSelectAll = (itemId) => {
+         setItems(items.map(item => {
+            if (item.id === itemId) {
+                // If everyone is already selected, unselect all. Otherwise, select all.
+                const allSelected = item.assigned.length === housemates.length;
+                return { ...item, assigned: allSelected ? [] : [...housemates] };
+            }
+            return item;
+        }));
+    };
+
+    const handleAddItem = () => {
+        setItems([...items, { id: generateUniqueId(), name: '', price: '', assigned: [] }]);
+    };
+
+    const handleRemoveItem = (id) => {
+        if (items.length > 1) {
+            setItems(items.filter(item => item.id !== id));
+        }
+    };
+
+    const calculateTotals = async () => {
+        const validItems = items.filter(item => item.name.trim() && parseFloat(item.price) > 0 && item.assigned.length > 0);
+        if (validItems.length === 0) {
+            setError("Please add at least one valid item with a price and assign it to someone.");
+            return;
+        }
+        setError('');
+
+        const finalTotals = {};
+        const itemBreakdown = {};
+        const participants = new Set();
+
+        housemates.forEach(h => {
+            finalTotals[h] = 0;
+            itemBreakdown[h] = [];
+        });
+
+        validItems.forEach(item => {
+            const price = parseFloat(item.price);
+            const numPeople = item.assigned.length;
+            const share = price / numPeople;
+            item.assigned.forEach(person => {
+                finalTotals[person] += share;
+                itemBreakdown[person].push({ name: item.name, share: share });
+                participants.add(person);
+            });
+        });
+
+        const taxNum = parseFloat(tax) || 0;
+        const tipNum = parseFloat(tip) || 0;
+        const additionalCosts = taxNum + tipNum;
+
+        if (additionalCosts > 0 && participants.size > 0) {
+            const shareOfAdditional = additionalCosts / participants.size;
+            participants.forEach(person => {
+                finalTotals[person] += shareOfAdditional;
+                if (taxNum > 0) itemBreakdown[person].push({ name: 'Tax', share: taxNum / participants.size });
+                if (tipNum > 0) itemBreakdown[person].push({ name: 'Tip', share: tipNum / participants.size });
+            });
+        }
+        
+        const grandTotal = validItems.reduce((sum, item) => sum + parseFloat(item.price), 0) + additionalCosts;
+
+        const resultData = {
+            title: billTitle || `Bill from ${new Date().toLocaleDateString()}`,
+            totals: finalTotals,
+            breakdown: itemBreakdown,
+            items: validItems,
+            tax: taxNum,
+            tip: tipNum,
+            grandTotal: grandTotal,
+            createdAt: new Date(),
+        };
+        
+        setResults(resultData);
+        
+        try {
+            const billsCollectionRef = collection(db, `artifacts/${__app_id}/users/${userId}/bills`);
+            await addDoc(billsCollectionRef, resultData);
+            setCurrentView('results');
+        } catch (e) {
+            console.error("Error saving bill:", e);
+            setError("Failed to save the bill details. Please try again.");
+        }
+    };
+    
+    const startNewSplit = () => {
+        setItems([{ id: generateUniqueId(), name: '', price: '', assigned: [] }]);
+        setTax('');
+        setTip('');
+        setBillTitle('');
+        setResults(null);
+        setSelectedBill(null);
+        setCurrentView('split');
+    };
+
+    const viewHistoryBill = (bill) => {
+        setSelectedBill(bill);
+        setCurrentView('historyDetail');
+    };
+
+    // --- Render Logic ---
+
+    const renderView = () => {
+        switch (currentView) {
+            case 'loading':
+                return <LoadingSpinner />;
+            case 'error':
+                return <ErrorMessage message={error} />;
+            case 'setup':
+                return <HousemateSetupView 
+                            tempHousemates={tempHousemates} 
+                            setTempHousemates={setTempHousemates}
+                            onSave={handleSaveHousemates}
+                            error={error}
+                        />;
+            case 'split':
+                return <BillSplitterView 
+                            housemates={housemates}
+                            items={items}
+                            tax={tax}
+                            tip={tip}
+                            billTitle={billTitle}
+                            setBillTitle={setBillTitle}
+                            onItemChange={handleItemChange}
+                            onAssignPerson={handleAssignPerson}
+                            onSelectAll={handleSelectAll}
+                            onAddItem={handleAddItem}
+                            onRemoveItem={handleRemoveItem}
+                            setTax={setTax}
+                            setTip={setTip}
+                            onCalculate={calculateTotals}
+                            onEditHousemates={() => { setIsEditingHousemates(true); setCurrentView('setup'); }}
+                            onViewHistory={() => setCurrentView('history')}
+                            error={error}
+                        />;
+            case 'results':
+                return <ResultsView 
+                            results={results} 
+                            onStartNew={startNewSplit}
+                            onViewHistory={() => setCurrentView('history')}
+                        />;
+            case 'history':
+                return <HistoryView 
+                            bills={pastBills}
+                            onViewBill={viewHistoryBill}
+                            onBack={startNewSplit}
+                        />;
+            case 'historyDetail':
+                return <ResultsView 
+                            results={selectedBill}
+                            onStartNew={startNewSplit}
+                            onViewHistory={() => setCurrentView('history')}
+                            isHistoryView={true}
+                        />;
+            default:
+                return <LoadingSpinner />;
+        }
+    };
+
+    return (
+        <div className="bg-gray-50 min-h-screen font-sans text-gray-800">
+            <div className="container mx-auto p-4 md:p-8 max-w-4xl">
+                <Header />
+                <main className="mt-6">
+                    {renderView()}
+                </main>
+            </div>
+        </div>
+    );
+}
+
+// --- Sub-Components ---
+
+const Header = () => (
+    <header className="text-center">
+        <h1 className="text-4xl md:text-5xl font-bold text-green-700">Smart Bill Splitter</h1>
+        <p className="text-lg text-gray-500 mt-2">Add items, assign to housemates, and split costs fairly.</p>
+    </header>
+);
+
+const LoadingSpinner = () => (
+    <div className="flex justify-center items-center p-16">
+        <div className="animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-green-600"></div>
+    </div>
+);
+
+const ErrorMessage = ({ message }) => (
+    <div className="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 rounded-md shadow-md" role="alert">
+        <p className="font-bold">An Error Occurred</p>
+        <p>{message}</p>
+    </div>
+);
+
+const HousemateSetupView = ({ tempHousemates, setTempHousemates, onSave, error }) => {
+    const handleInputChange = (index, value) => {
+        const newHousemates = [...tempHousemates];
+        newHousemates[index] = value;
+        setTempHousemates(newHousemates);
+    };
+
+    return (
+        <Card>
+            <h2 className="text-2xl font-semibold mb-4 text-gray-700">
+                <UserGroupIcon /> Who's in your house?
+            </h2>
+            <p className="text-gray-500 mb-6">Enter the names of up to 7 people. You'll need at least two.</p>
+            {error && <p className="text-red-500 mb-4">{error}</p>}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {tempHousemates.map((name, index) => (
+                    <input
+                        key={index}
+                        type="text"
+                        value={name}
+                        onChange={(e) => handleInputChange(index, e.target.value)}
+                        placeholder={`Person ${index + 1}`}
+                        className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
+                    />
+                ))}
+            </div>
+            <button
+                onClick={onSave}
+                className="w-full mt-6 bg-green-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-700 transition-colors duration-300 flex items-center justify-center shadow-lg"
+            >
+                <SaveIcon /> Save Housemates
+            </button>
+        </Card>
+    );
+};
+
+const BillSplitterView = ({ housemates, items, tax, tip, billTitle, setBillTitle, onItemChange, onAssignPerson, onSelectAll, onAddItem, onRemoveItem, setTax, setTip, onCalculate, onEditHousemates, onViewHistory, error }) => (
+    <div>
+        <div className="flex justify-between items-center mb-6">
+            <button onClick={onViewHistory} className="text-green-600 hover:text-green-800 font-semibold flex items-center gap-2"><HistoryIcon /> View History</button>
+        </div>
+        
+        <Card>
+            <div className="flex justify-between items-start">
+                <h2 className="text-2xl font-semibold mb-2 text-gray-700 flex items-center gap-2"><UserGroupIcon /> Our Housemates</h2>
+                <button onClick={onEditHousemates} className="text-sm text-green-600 hover:text-green-800 font-semibold flex items-center gap-1"><PencilIcon /> Edit</button>
+            </div>
+            <div className="flex flex-wrap gap-2 mb-6">
+                {housemates.map(name => (
+                    <span key={name} className="bg-green-100 text-green-800 text-sm font-medium px-3 py-1 rounded-full">{name}</span>
+                ))}
+            </div>
+        </Card>
+
+        <Card>
+            <h2 className="text-2xl font-semibold mb-4 text-gray-700 flex items-center gap-2"><ReceiptIcon /> Verify & Split Items</h2>
+            <div className="mb-6">
+                <label htmlFor="billTitle" className="block text-sm font-medium text-gray-600 mb-1">Bill Title (Optional)</label>
+                <input
+                    id="billTitle"
+                    type="text"
+                    value={billTitle}
+                    onChange={(e) => setBillTitle(e.target.value)}
+                    placeholder={`e.g., Weekly Groceries - ${new Date().toLocaleDateString()}`}
+                    className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent transition"
+                />
+            </div>
+
+            {items.map((item, index) => (
+                <ItemInput 
+                    key={item.id} 
+                    item={item} 
+                    index={index}
+                    housemates={housemates}
+                    onItemChange={onItemChange} 
+                    onAssignPerson={onAssignPerson}
+                    onSelectAll={onSelectAll}
+                    onRemoveItem={onRemoveItem}
+                    isLastItem={items.length === 1}
+                />
+            ))}
+            
+            <button onClick={onAddItem} className="mt-4 text-green-600 font-semibold hover:text-green-800 flex items-center gap-2">
+                <PlusCircleIcon /> Add Another Item
+            </button>
+
+            <hr className="my-6" />
+
+            <h3 className="text-xl font-semibold mb-4 text-gray-700">Additional Costs</h3>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+                <div>
+                    <label htmlFor="tax" className="block text-sm font-medium text-gray-600">Tax</label>
+                    <div className="relative">
+                        <span className="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-500">$</span>
+                        <input id="tax" type="number" value={tax} onChange={e => setTax(e.target.value)} placeholder="0.00" className="w-full pl-7 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent transition" />
+                    </div>
+                </div>
+                <div>
+                    <label htmlFor="tip" className="block text-sm font-medium text-gray-600">Tip</label>
+                     <div className="relative">
+                        <span className="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-500">$</span>
+                        <input id="tip" type="number" value={tip} onChange={e => setTip(e.target.value)} placeholder="0.00" className="w-full pl-7 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent transition" />
+                    </div>
+                </div>
+            </div>
+            <p className="text-xs text-gray-500 mb-6">Tax and tip will be split equally among everyone who has at least one item assigned.</p>
+            
+            {error && <p className="text-red-500 mb-4 text-center">{error}</p>}
+
+            <button onClick={onCalculate} className="w-full bg-green-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-700 transition-colors duration-300 flex items-center justify-center shadow-lg text-lg">
+                <CalculatorIcon /> Calculate Totals
+            </button>
+        </Card>
+    </div>
+);
+
+const ItemInput = ({ item, index, housemates, onItemChange, onAssignPerson, onSelectAll, onRemoveItem, isLastItem }) => (
+    <div className="bg-gray-50 p-4 rounded-lg border border-gray-200 mb-4 transition-shadow hover:shadow-md">
+        <div className="grid grid-cols-1 md:grid-cols-12 gap-4 items-start">
+            <div className="md:col-span-6">
+                <label className="block text-sm font-medium text-gray-600 mb-1">Item Name</label>
+                <input 
+                    type="text" 
+                    value={item.name} 
+                    onChange={e => onItemChange(item.id, 'name', e.target.value)} 
+                    placeholder={`Item #${index + 1}`}
+                    className="w-full px-3 py-2 border border-gray-300 rounded-md focus:ring-1 focus:ring-green-500"
+                />
+            </div>
+            <div className="md:col-span-4">
+                <label className="block text-sm font-medium text-gray-600 mb-1">Price</label>
+                 <div className="relative">
+                    <span className="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-500">$</span>
+                    <input 
+                        type="number" 
+                        value={item.price} 
+                        onChange={e => onItemChange(item.id, 'price', e.target.value)} 
+                        placeholder="0.00"
+                        className="w-full pl-7 pr-3 py-2 border border-gray-300 rounded-md focus:ring-1 focus:ring-green-500"
+                    />
+                </div>
+            </div>
+            <div className="md:col-span-2 flex items-end justify-end h-full">
+                {!isLastItem && (
+                    <button onClick={() => onRemoveItem(item.id)} className="text-red-500 hover:text-red-700 p-2 rounded-full hover:bg-red-100 transition">
+                        <TrashIcon />
+                    </button>
+                )}
+            </div>
+        </div>
+        <div className="mt-4">
+            <div className="flex justify-between items-center mb-2">
+                <label className="block text-sm font-medium text-gray-600">Assign to:</label>
+                <button onClick={() => onSelectAll(item.id)} className="text-xs font-semibold text-green-600 hover:text-green-800">
+                    {item.assigned.length === housemates.length ? 'Unselect All' : 'Select All'}
+                </button>
+            </div>
+            <div className="flex flex-wrap gap-2">
+                {housemates.map(name => (
+                    <button 
+                        key={name}
+                        onClick={() => onAssignPerson(item.id, name)}
+                        className={`px-3 py-1 text-sm font-medium rounded-full border transition-colors ${item.assigned.includes(name) ? 'bg-green-600 text-white border-green-600' : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-100'}`}
+                    >
+                        {name}
+                    </button>
+                ))}
+            </div>
+        </div>
+    </div>
+);
+
+const ResultsView = ({ results, onStartNew, onViewHistory, isHistoryView = false }) => {
+    const [modalPerson, setModalPerson] = useState(null);
+
+    if (!results) {
+        return <ErrorMessage message="No results to display." />;
+    }
+
+    const { totals, grandTotal, title } = results;
+
+    return (
+        <div className="bg-green-600 text-white p-6 md:p-8 rounded-lg shadow-2xl">
+            <h2 className="text-3xl font-bold text-center mb-2">
+                {isHistoryView ? "Bill Details" : "Bill Successfully Split!"}
+            </h2>
+            <p className="text-center text-green-200 mb-6">{title}</p>
+            
+            <div className="space-y-3 mb-6">
+                {Object.entries(totals).sort(([, a], [, b]) => b - a).map(([name, amount]) => (
+                    <div 
+                        key={name} 
+                        onClick={() => setModalPerson(name)}
+                        className="bg-green-700 p-4 rounded-lg flex justify-between items-center cursor-pointer hover:bg-green-800 transition-colors shadow"
+                    >
+                        <span className="font-bold text-lg">{name}</span>
+                        <span className="font-mono text-xl">${amount.toFixed(2)}</span>
+                    </div>
+                ))}
+            </div>
+
+            <div className="border-t-2 border-green-500 pt-4 flex justify-between items-center">
+                <span className="text-xl font-bold">Grand Total</span>
+                <span className="font-mono text-2xl font-bold">${grandTotal.toFixed(2)}</span>
+            </div>
+
+            <div className="mt-8 flex flex-col md:flex-row gap-4">
+                <button onClick={onStartNew} className="w-full bg-white text-green-700 font-bold py-3 px-4 rounded-lg hover:bg-green-100 transition-colors flex items-center justify-center gap-2">
+                    <PlusCircleIcon /> Split Another Bill
+                </button>
+                <button onClick={onViewHistory} className="w-full bg-green-500 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-400 transition-colors flex items-center justify-center gap-2">
+                    <HistoryIcon /> View History
+                </button>
+            </div>
+
+            {modalPerson && (
+                <PersonDetailModal 
+                    person={modalPerson} 
+                    breakdown={results.breakdown[modalPerson]}
+                    total={totals[modalPerson]}
+                    onClose={() => setModalPerson(null)} 
+                />
+            )}
+        </div>
+    );
+};
+
+const PersonDetailModal = ({ person, breakdown, total, onClose }) => (
+    <div 
+        className="fixed inset-0 bg-black bg-opacity-60 flex justify-center items-center z-50 p-4"
+        onClick={onClose}
+    >
+        <div 
+            className="bg-white text-gray-800 rounded-lg shadow-xl w-full max-w-md transform transition-all"
+            onClick={e => e.stopPropagation()}
+        >
+            <div className="p-6">
+                <div className="flex justify-between items-center mb-4">
+                    <h3 className="text-2xl font-bold text-green-700">{person}'s Items</h3>
+                    <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
+                        <CloseIcon />
+                    </button>
+                </div>
+                <div className="max-h-64 overflow-y-auto pr-2">
+                    <table className="w-full text-left">
+                        <tbody>
+                            {breakdown.map((item, index) => (
+                                <tr key={index} className="border-b border-gray-200">
+                                    <td className="py-2">{item.name}</td>
+                                    <td className="py-2 text-right font-mono">${item.share.toFixed(2)}</td>
+                                </tr>
+                            ))}
+                        </tbody>
+                    </table>
+                </div>
+                <div className="mt-4 pt-4 border-t-2 border-gray-200 flex justify-between items-center">
+                    <span className="text-lg font-bold">Total</span>
+                    <span className="text-xl font-bold font-mono text-green-700">${total.toFixed(2)}</span>
+                </div>
+            </div>
+            <div className="bg-gray-50 px-6 py-3 text-right">
+                 <button 
+                    onClick={onClose} 
+                    className="bg-green-600 text-white font-semibold py-2 px-6 rounded-lg hover:bg-green-700 transition"
+                >
+                    Close
+                </button>
+            </div>
+        </div>
+    </div>
+);
+
+const HistoryView = ({ bills, onViewBill, onBack }) => (
+    <Card>
+        <div className="flex justify-between items-center mb-6">
+            <h2 className="text-2xl font-semibold text-gray-700 flex items-center gap-2"><HistoryIcon /> Bill History</h2>
+            <button onClick={onBack} className="text-green-600 hover:text-green-800 font-semibold flex items-center gap-2"><PlusCircleIcon /> New Split</button>
+        </div>
+        {bills.length === 0 ? (
+            <p className="text-gray-500 text-center py-8">You have no saved bills yet.</p>
+        ) : (
+            <div className="space-y-4">
+                {bills.map(bill => (
+                    <div 
+                        key={bill.id} 
+                        onClick={() => onViewBill(bill)}
+                        className="p-4 border border-gray-200 rounded-lg cursor-pointer hover:shadow-md hover:border-green-400 transition flex justify-between items-center"
+                    >
+                        <div>
+                            <p className="font-bold text-gray-800">{bill.title}</p>
+                            <p className="text-sm text-gray-500">{bill.createdAt.toDate().toLocaleDateString()}</p>
+                        </div>
+                        <span className="font-mono text-lg font-semibold text-green-600">${bill.grandTotal.toFixed(2)}</span>
+                    </div>
+                ))}
+            </div>
+        )}
+    </Card>
+);
+
+// --- UI Helper Components ---
+const Card = ({ children }) => (
+    <div className="bg-white p-6 md:p-8 rounded-xl shadow-md mb-6">
+        {children}
+    </div>
+);
+
+// --- SVG Icons ---
+const UserGroupIcon = () => <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 inline-block" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.653-.124-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.653.124-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z" /></svg>;
+const SaveIcon = () => <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" /></svg>;
+const ReceiptIcon = () => <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 inline-block" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>;
+const PencilIcon = () => <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 inline-block" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.536L16.732 3.732z" /></svg>;
+const PlusCircleIcon = () => <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 inline-block" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v3m0 0v3m0-3h3m-3 0H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>;
+const CalculatorIcon = () => <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 7h6m-6 4h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>;
+const TrashIcon = () => <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>;
+const CloseIcon = () => <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>;
+const HistoryIcon = () => <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5 inline-block" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>;
